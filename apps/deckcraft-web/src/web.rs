@@ -28,8 +28,8 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
-        // `?host=parent`: a same-origin page framing DeckCraft opens presentations in it and
-        // stores what it saves (`host`).
+        // `?host=parent`: a page framing DeckCraft (same-origin unless `&hostOrigin=` names its
+        // origin) opens presentations in it and stores what it saves (`host`).
         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
         let app_bridge = bridge.clone();
         let result = eframe::WebRunner::new()
