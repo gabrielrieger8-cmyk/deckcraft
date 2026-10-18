@@ -6,7 +6,10 @@
 //!   `Uint8Array`. It opens like a presentation dropped on the window.
 //! - `deckcraft:save` (to the parent): `{ name, bytes }` (a transferred `ArrayBuffer`) for every
 //!   file DeckCraft would otherwise download: Save and Save As (a .deckcraft or .pptx
-//!   presentation) and the exports. The parent stores it and reports failures itself.
+//!   presentation) and the exports. The parent stores it and reports failures itself. Save of a
+//!   presentation the parent opened as `<name>.pptx` hands it back as `<name>.pptx` (a .pptx
+//!   file), not as the `.deckcraft` an untitled presentation would get, so Save writes the file
+//!   the parent sent.
 //! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
 //! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start.
 //!
@@ -42,6 +45,8 @@ pub struct Bridge {
     origin: String,
     /// Files from the parent since the last frame.
     received: Received,
+    /// Names of the files the parent sent, to save each in the format it came in.
+    opened: Rc<RefCell<Vec<String>>>,
     /// Names of the files handed to the parent since the last frame.
     saved: Rc<RefCell<Vec<String>>>,
     /// The unsaved-changes state last reported to the parent.
@@ -57,7 +62,7 @@ impl Bridge {
             return None;
         }
         let origin = host_origin(&window)?;
-        Some(Self { window, parent, origin, received: Rc::default(), saved: Rc::default(), reported: Rc::default() })
+        Some(Self { window, parent, origin, received: Rc::default(), opened: Rc::default(), saved: Rc::default(), reported: Rc::default() })
     }
 
     /// Send saved and exported files to the parent instead of downloading them, and hear files
@@ -68,7 +73,11 @@ impl Bridge {
         services.write = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes)));
         let bridge = self.clone();
         services.download = Some(Box::new(move |name: &str, bytes: &[u8]| {
-            if let Err(e) = bridge.post_save(name, bytes) {
+            let result = match bridge.in_opened_format(name, bytes) {
+                Some((opened, pptx)) => bridge.post_save(&opened, &pptx),
+                None => bridge.post_save(name, bytes),
+            };
+            if let Err(e) = result {
                 log::error!("couldn't hand {name} to the page: {e}");
             }
         }));
@@ -116,6 +125,26 @@ impl Bridge {
         }
     }
 
+    /// Save names an untitled presentation `<title>.deckcraft`. When the parent sent it as
+    /// `<title>.pptx`, the same presentation re-encoded as .pptx under that name, so the parent
+    /// gets back the kind of file it opened. `None` for any other file.
+    fn in_opened_format(&self, name: &str, bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+        let (stem, ext) = name.rsplit_once('.')?;
+        if !ext.eq_ignore_ascii_case("deckcraft") {
+            return None;
+        }
+        let opened =
+            self.opened.borrow().iter().rev().find(|o| o.rsplit_once('.').is_some_and(|(s, e)| s == stem && e.eq_ignore_ascii_case("pptx")))?.clone();
+        let pptx = deckcraft_engine::cmd::file::open_presentation(name, bytes).and_then(|doc| deckcraft_engine::cmd::file::save_bytes(&doc, "pptx"));
+        match pptx {
+            Ok(pptx) => Some((opened, pptx)),
+            Err(e) => {
+                log::error!("couldn't save {opened} as .pptx ({e}); handing over {name}");
+                None
+            }
+        }
+    }
+
     fn post_save(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
@@ -132,6 +161,7 @@ impl Bridge {
         let parent = self.parent.clone();
         let origin = self.origin.clone();
         let received = self.received.clone();
+        let opened = self.opened.clone();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
                 return;
@@ -142,6 +172,7 @@ impl Bridge {
             }
             let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Presentation.pptx".to_string());
             let Some(bytes) = bytes(&data) else { return };
+            opened.borrow_mut().push(name.clone());
             received.borrow_mut().push((name, bytes));
             ctx.request_repaint();
         });
